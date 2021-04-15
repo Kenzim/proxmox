@@ -6,7 +6,6 @@ use warnings;
 use File::Path;
 use Digest::SHA;
 use URI::Escape;
-use MIME::Base64 qw(encode_base64);
 
 use PVE::Tools qw(run_command file_set_contents);
 use PVE::Storage;
@@ -162,15 +161,7 @@ sub configdrive2_network {
     my $content = "auto lo\n";
     $content .= "iface lo inet loopback\n\n";
 
-    my ($searchdomains, $nameservers) = get_dns_conf($conf);
-    if ($nameservers && @$nameservers) {
-	$nameservers = join(' ', @$nameservers);
-	$content .= "        dns_nameservers $nameservers\n";
-    }
-    if ($searchdomains && @$searchdomains) {
-	$searchdomains = join(' ', @$searchdomains);
-	$content .= "        dns_search $searchdomains\n";
-    }
+    
 
     my @ifaces = grep { /^net(\d+)$/ } keys %$conf;
     foreach my $iface (sort @ifaces) {
@@ -204,6 +195,12 @@ sub configdrive2_network {
 	}
     }
 
+	my ($searchdomains, $nameservers) = get_dns_conf($conf);
+    if ($nameservers && @$nameservers) {
+	$nameservers = join(' ', @$nameservers);
+	$content .= "        dns-nameservers $nameservers\n";
+    }
+
     return $content;
 }
 
@@ -215,141 +212,60 @@ sub configdrive2_gen_metadata {
 }
 
 sub configdrive2_metadata {
-    my ($uuid) = @_;
-    return <<"EOF";
+        my ($conf, $vmid, $user, $network) = @_;
+        my $uuid = Digest::SHA::sha1_hex($user.$network);
+        my $password = $conf->{cipassword};
+        my ($hostname, $fqdn) = get_hostname_fqdn($conf, $vmid);
+        my $startConfig =  <<"EOF";
 {
-     "uuid": "$uuid",
-     "network_config": { "content_path": "/content/0000" }
-}
+    "hostname": "$hostname",
+    "uuid": "$uuid",
+    "admin_pass": "$password",
 EOF
-}
+        if (defined(my $keys = $conf->{sshkeys})) {
+            $startConfig .= "     \"network_config\": { \"content_path\": \"/content/0000\" },\n";
+            $keys = URI::Escape::uri_unescape($keys);
+            $keys = [map { my $key = $_; chomp $key; $key } split(/\n/, $keys)];
+            $keys = [grep { /\S/ } @$keys];
+            $startConfig .= "     \"keys\": [\n";
+            $startConfig .= "         {\n";
 
+            my $keyCount = @$keys;
+            for (my $i=0; $i < $keyCount; $i++) {
+            #    $startConfig .= "  $keyCount   "
+                if ($i == $keyCount-1){
+                    $startConfig .= "           \"key-$i\": \"".$keys->[$i]."\"\n";
+                } else {
+                    $startConfig .= "           \"key-$i\": \"".$keys->[$i]."\",\n";
+                }
+            }
+
+            $startConfig .= "         }\n";
+            $startConfig .= "     ]\n";
+
+        } else{
+            $startConfig .= "     \"network_config\": { \"content_path\": \"/content/0000\" }\n";
+        }
+        $startConfig.= "}";
+        return $startConfig;
+
+}
 sub generate_configdrive2 {
     my ($conf, $vmid, $drive, $volname, $storeid) = @_;
-	my ($hostname, $fqdn) = get_hostname_fqdn($conf, $vmid);
-	my $password = $conf->{cipassword};
-	my $meta_data = "{\n    \"hostname\": \"$hostname\",\n    \"password\": \"$password\"";
-	my @ifaces = grep { /^net(\d+)$/ } keys %$conf;
-	if (scalar @ifaces != 0){
-		foreach my $iface (sort @ifaces) {
-			(my $id = $iface) =~ s/^net//;
-			next if !$conf->{"ipconfig$id"};
-			my $net = PVE::QemuServer::parse_ipconfig($conf->{"ipconfig$id"});
-			if ($net->{ip}) {
-				my ($addr, $mask) = split_ip4($net->{ip});
-				$meta_data .= ",\n    \"ip4_enabled\": true";
-				$meta_data .= ",\n    \"ip4\": \"$addr\"";
-				$meta_data .= ",\n    \"ip4_mask\": \"$mask\"";
-				$meta_data .= ",\n    \"ip4_gw\": \"$net->{gw}\"" if $net->{gw};
-			} else {
-				$meta_data .= ",\n    \"ip4_enabled\": false";
-			}
-			if ($net->{ip6}) {
-				my ($addr, $mask) = split('/', $net->{ip6});
-				$meta_data .= ",\n    \"ip6_enabled\": true";
-				$meta_data .= ",\n    \"ip6\": \"$addr\"";
-				$meta_data .= ",\n    \"ip6_mask\": \"$mask\"";
-				$meta_data .= ",\n    \"ip6_gw\": \"$net->{gw6}\"" if $net->{gw6};
-			} else {
-				$meta_data .= ",\n    \"ip6_enabled\": false";
-			}
-		}
-	}
-	$meta_data .= "\n}";
+
+    my ($user_data, $network_data, $meta_data) = get_custom_cloudinit_files($conf);
+    $user_data = cloudinit_userdata($conf, $vmid) if !defined($user_data);
+    $network_data = configdrive2_network($conf) if !defined($network_data);
+
+    if (!defined($meta_data)) {
+    $meta_data = configdrive2_metadata($conf, $vmid, $user_data, $network_data);
+    }
     my $files = {
-	'/metadata.json' => $meta_data
+	'/openstack/latest/user_data' => $user_data,
+	'/openstack/content/0000' => $network_data,
+	'/openstack/latest/meta_data.json' => $meta_data
     };
-    commit_cloudinit_disk($conf, $vmid, $drive, $volname, $storeid, $files, 'metadata');
-}
-
-sub generate_opennebula {
-    my ($conf, $vmid, $drive, $volname, $storeid) = @_;
-
-    my ($hostname, $fqdn) = get_hostname_fqdn($conf, $vmid);
-
-    my $content = "";
-
-    my $username = $conf->{ciuser} || "root";
-    my $password = encode_base64($conf->{cipassword}) if defined($conf->{cipassword});
-
-    $content .= "USERNAME=$username\n" if defined($username);
-    $content .= "CRYPTED_PASSWORD_BASE64=$password\n" if defined($password);
-
-    if (defined(my $keys = $conf->{sshkeys})) {
-        $keys = URI::Escape::uri_unescape($keys);
-        $keys = [map { my $key = $_; chomp $key; $key } split(/\n/, $keys)];
-        $keys = [grep { /\S/ } @$keys];
-        $content .= "SSH_PUBLIC_KEY=\"";
-
-        foreach my $k (@$keys) {
-	     $content .= "$k\n";
-        }
-        $content .= "\"\n";
-
-    }
-
-    my ($searchdomains, $nameservers) = get_dns_conf($conf);
-    if ($nameservers && @$nameservers) {
-        $nameservers = join(' ', @$nameservers);
-        $content .= "DNS=\"$nameservers\"\n";
-    }
-
-    $content .= "SET_HOSTNAME=$hostname\n";
-
-    if ($searchdomains && @$searchdomains) {
-        $searchdomains = join(' ', @$searchdomains);
-        $content .= "SEARCH_DOMAIN=\"$searchdomains\"\n";
-    }
-
-    my $networkenabled = undef;
-    my @ifaces = grep { /^net(\d+)$/ } keys %$conf;
-    foreach my $iface (sort @ifaces) {
-        (my $id = $iface) =~ s/^net//;
-	my $net = PVE::QemuServer::parse_net($conf->{$iface});
-        next if !$conf->{"ipconfig$id"};
-	my $ipconfig = PVE::QemuServer::parse_ipconfig($conf->{"ipconfig$id"});
-        my $ethid = "ETH$id";
-
-	my $mac = lc $net->{hwaddr};
-
-	if ($ipconfig->{ip}) {
-	    $networkenabled = 1;
-
-	    if ($ipconfig->{ip} eq 'dhcp') {
-		$content .= $ethid."_DHCP=YES\n";
-	    } else {
-		my ($addr, $mask) = split_ip4($ipconfig->{ip});
-		$content .= $ethid."_IP=$addr\n";
-		$content .= $ethid."_MASK=$mask\n";
-		$content .= $ethid."_MAC=$mac\n";
-		$content .= $ethid."_GATEWAY=$ipconfig->{gw}\n" if $ipconfig->{gw};
-	    }
-	    $content .= $ethid."_MTU=$net->{mtu}\n" if $net->{mtu};
-	}
-
-	if ($ipconfig->{ip6}) {
-	    $networkenabled = 1;
-	    if ($ipconfig->{ip6} eq 'dhcp') {
-		$content .= $ethid."_DHCP6=YES\n";
-	    } elsif ($ipconfig->{ip6} eq 'auto') {
-		$content .= $ethid."_AUTO6=YES\n";
-	    } else {
-		my ($addr, $mask) = split('/', $ipconfig->{ip6});
-		$content .= $ethid."_IP6=$addr\n";
-		$content .= $ethid."_MASK6=$mask\n";
-		$content .= $ethid."_MAC6=$mac\n";
-		$content .= $ethid."_GATEWAY6=$ipconfig->{gw6}\n" if $ipconfig->{gw6};
-	    }
-	    $content .= $ethid."_MTU=$net->{mtu}\n" if $net->{mtu};
-	}
-    }
-
-    $content .= "NETWORK=YES\n" if $networkenabled;
-
-    my $files = {
-	'/context.sh' => $content,
-    };
-    commit_cloudinit_disk($conf, $vmid, $drive, $volname, $storeid, $files, 'CONTEXT');
+    commit_cloudinit_disk($conf, $vmid, $drive, $volname, $storeid, $files, 'config-2');
 }
 
 sub nocloud_network_v2 {
@@ -570,7 +486,6 @@ sub read_cloudinit_snippets_file {
 my $cloudinit_methods = {
     configdrive2 => \&generate_configdrive2,
     nocloud => \&generate_nocloud,
-    opennebula => \&generate_opennebula,
 };
 
 sub generate_cloudinitconfig {
